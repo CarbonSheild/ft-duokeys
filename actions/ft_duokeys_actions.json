@@ -1,0 +1,72 @@
+{
+  "default_bindings": [
+    {
+      "controller_type": "frame_controller",
+      "binding_url": "bindings_frame_controller.json"
+    }
+  ],
+  "action_sets": [
+    {
+      "name": "/actions/duokeys_left",
+      "usage": "hidden"
+    },
+    {
+      "name": "/actions/duokeys_right",
+      "usage": "hidden"
+    },
+    {
+      "name": "/actions/duokeys_idle",
+      "usage": "hidden"
+    }
+  ],
+  "actions": [
+    {
+      "name": "/actions/duokeys_left/in/press",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/duokeys_left/in/other",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/duokeys_left/in/stick",
+      "type": "vector2"
+    },
+    {
+      "name": "/actions/duokeys_left/out/haptic",
+      "type": "vibration"
+    },
+    {
+      "name": "/actions/duokeys_right/in/press",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/duokeys_right/in/other",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/duokeys_right/in/stick",
+      "type": "vector2"
+    },
+    {
+      "name": "/actions/duokeys_right/out/haptic",
+      "type": "vibration"
+    }
+  ],
+  "localization": [
+    {
+      "language_tag": "en_US",
+      "/actions/duokeys_left": "Keyboard (left hand)",
+      "/actions/duokeys_left/in/press": "Press key",
+      "/actions/duokeys_left/in/other": "Other buttons (held back from apps)",
+      "/actions/duokeys_left/in/stick": "Thumbstick (held back from apps)",
+      "/actions/duokeys_left/out/haptic": "Key press pulse",
+      "/actions/duokeys_right": "Keyboard (right hand)",
+      "/actions/duokeys_right/in/press": "Press key",
+      "/actions/duokeys_right/in/other": "Other buttons (held back from apps)",
+      "/actions/duokeys_right/in/stick": "Thumbstick (held back from apps)",
+      "/actions/duokeys_right/out/haptic": "Key press pulse",
+      "/actions/duokeys_idle": "Keyboard (nothing bound)"
+    }
+  ]
+}

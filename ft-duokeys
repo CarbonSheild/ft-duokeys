@@ -1,0 +1,819 @@
+#!/usr/bin/env python3
+"""ft-duokeys: a VR keyboard that both controllers type on at once.
+
+SteamVR's own keyboard (and any overlay that uses its laser mouse) follows one controller
+at a time. This one reads both controllers' poses itself, casts a ray from each one's tip,
+and draws a cursor and a laser for each hand. A trigger pull presses the key under that
+hand's ray. The triggers are read from vrserver's web socket (vrws.py), which works without
+input focus and takes nothing from anyone.
+
+A press also reaches whatever SteamVR's laser points at behind the keyboard (sharing, the
+default), so it opens low, where usually nothing is. Two ways to keep presses from it, both
+of which fell short on the Frame (October 2026):
+  - Absorbing (--absorb): the panel is a SteamVR mouse-input overlay, so SteamVR's laser
+    lands on it and its click goes nowhere; the clicks also type, with SteamVR's timing.
+    But SteamVR's laser follows one hand: the first pull after switching hands only moves
+    it (vrserver's press stands in for it, if it saw one), and the laser can land on
+    another overlay in front (Frametop's own keyboard, which opens for text fields).
+  - Taking (--take): while a hand's ray is on the keyboard, that hand's action set
+    (actions/ft_duokeys_actions.json: its trigger and every other button) goes active at an
+    overlay-global priority, so SteamVR should hold those buttons back from the app behind.
+    That needs "Enable global input from overlays (Experimental)"
+    (steamvr/globalActionSetPriority). On the Frame (October 2026) SteamVR delivers nothing
+    to such sets with no game running, even after a restart, so when a taken hand's set
+    isn't delivered within half a second this falls back to the default. A hand is taken or
+    given back only while its trigger is up, or the app with the press would keep it held.
+
+Keys go out through a virtual keyboard (uinput.py, which says where they land).
+
+A trigger or a bumper pull presses the key under that hand's ray.
+
+Opening and closing: press both grips together (within 0.3 s of each other), or
+`ft-duokeys toggle`. It opens in front of you, below eye level, or where you last put it
+down with its grab bar (seen from your head; ~/.config/ft-duokeys.json; `ft-duokeys
+reset-place` forgets it). The Close key closes it.
+Grips are read from vrserver's web socket, so the combination takes nothing from games.
+
+  ft-duokeys [--show] [--absorb | --take] [--no-keys] [--log-hits] [--enable-global-input]
+  ft-duokeys toggle|show|hide|status|reset-place   (to the running one, @ft_duokeys)
+
+  --show                 open the keyboard at start
+  --absorb               SteamVR's laser lands on the panel and its clicks go nowhere
+  --take                 take each hand's buttons with global priority (see above)
+  --no-keys              don't create the virtual keyboard; only log what would be typed
+  --log-hits             log each hand's key under its ray as it changes (the spike)
+  --enable-global-input  turn on steamvr/globalActionSetPriority (a SteamVR setting that
+                         stays on; Frametop Input Settings has the same switch)
+"""
+import collections
+import ctypes
+import json
+import math
+import os
+import signal
+import socket
+import sys
+import threading
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+
+import hands  # noqa: E402
+import layout  # noqa: E402
+
+CONTROL = "\0ft_duokeys"
+COMMANDS = ("toggle", "show", "hide", "status", "reset-place")
+CONFIG = os.path.expanduser("~/.config/ft-duokeys.json")
+FRAME = 1 / 90
+IDLE_FRAME = 1 / 10  # while the keyboard is closed: it only waits for the grips
+PANEL_WIDTH = 0.62  # metres; a letter key is about 4 cm
+CHORD_WINDOW = 0.3
+COMBO = "grip"  # both pressed together open and close the keyboard (the bumpers type)
+PULL, RELEASE = 0.55, 0.3  # trigger value thresholds
+HAPTIC = (0.0, 0.012, 160.0, 0.35)  # start, seconds, Hz, amplitude
+# Above Frametop's mapped controller buttons (k_nActionSetOverlayGlobalPriorityMin + 0x100 in
+# its pointer helper), so a trigger mapped there still comes here while on the keyboard.
+PRIORITY_OFFSET = 0x200
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def control_client(cmd):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    s.bind("")  # autobind, so the reply has somewhere to go
+    s.settimeout(2)
+    try:
+        s.sendto(cmd.encode(), CONTROL)
+        print(s.recv(4096).decode())
+    except (ConnectionRefusedError, FileNotFoundError):
+        sys.exit("ft-duokeys isn't running")
+    except socket.timeout:
+        sys.exit("ft-duokeys didn't answer")
+
+
+class RawButtons(threading.Thread):
+    """Both controllers' raw clicks from vrserver's web socket (takes nothing from anyone).
+    state[side][name] is True while down (name like "trigger", "bumper"; "press" is trigger
+    or bumper). Calls on_combo() when both grips go down together."""
+
+    def __init__(self, on_combo):
+        super().__init__(name="vrws", daemon=True)
+        self.on_combo = on_combo
+        self.log_raw = False
+        # Trigger presses counted as they come: vrserver often sends a quick pull's press and
+        # release in one batch, between two frames, so sampling down() would miss it.
+        self.presses = {"left": 0, "right": 0}
+        self.state = {"left": {}, "right": {}}
+        self.trigger_click = {"left": False, "right": False}
+        self.connected = False
+        self.combo_armed = True
+        self.down_at = {}
+
+    def down(self, side, name):
+        return self.state[side].get(name, False)
+
+    def run(self):
+        import vrws
+        while True:
+            ws = None
+            try:
+                ws = vrws.VrSocket()
+                ws.open(f"ft_duokeys_{os.getpid()}")
+                sides = vrws.controllers()
+                for path in sides:
+                    ws.subscribe(path)
+                self.connected = bool(sides)
+                log(f"vrws: following {', '.join(f'{s} {p}' for p, s in sides.items()) or 'no controllers'}")
+                last_lookup = time.monotonic()
+                while True:
+                    for text in ws.messages(timeout=1.0):
+                        if "/click" not in text and "/trigger/value" not in text:
+                            continue  # mostly capacitive sensing
+                        msg = json.loads(text)
+                        side = sides.get(msg.get("device"))
+                        if side is None:
+                            last_lookup = 0  # a device we don't know: look the controllers up again
+                            continue
+                        comps = msg.get("components", {})
+                        for comp, value in comps.items():
+                            if comp == "/input/trigger/click":
+                                self.trigger_click[side] = bool(value)
+                            elif comp == "/input/trigger/value":
+                                self.trigger_value(side, float(value))
+                            elif comp.startswith("/input/") and comp.endswith("/click"):
+                                self.changed(side, comp[len("/input/"):-len("/click")], bool(value))
+                        if "/input/trigger/click" in comps and comps["/input/trigger/click"]:
+                            self.changed(side, "trigger", True)  # a click counts even if the value lagged
+                    # The 3D mouse taking a hand role changes that controller's path (vrws.py),
+                    # and a long-lived subscription here went quiet after a while (October 2026)
+                    # while a new one still got everything: look up and subscribe again often.
+                    if time.monotonic() - last_lookup > 5:
+                        found = vrws.controllers()
+                        for path in found:
+                            ws.subscribe(path)
+                        if found != sides:
+                            log(f"vrws: now following {', '.join(f'{s} {p}' for p, s in found.items())}")
+                        sides = found
+                        last_lookup = time.monotonic()
+            except (OSError, ValueError) as e:
+                self.connected = False
+                self.state = {"left": {}, "right": {}}
+                log(f"vrws: {e}; trying again in 5 s")
+            finally:
+                if ws:
+                    ws.close()
+            time.sleep(5)
+
+    def trigger_value(self, side, v):
+        """The trigger's analog value: down past PULL, up again below RELEASE. vrserver sends
+        it many times during a pull, where the click often came and went between two of its
+        batches and was lost."""
+        down = self.state[side].get("trigger", False)
+        if not down and v >= PULL:
+            self.changed(side, "trigger", True)
+        elif down and v <= RELEASE and not self.trigger_click[side]:
+            self.changed(side, "trigger", False)
+
+    def changed(self, side, name, value):
+        was = self.down(side, "press")
+        self.state[side][name] = value
+        # A key press is the trigger or the bumper: either one types.
+        now_down = self.down(side, "trigger") or self.down(side, "bumper")
+        self.state[side]["press"] = now_down
+        if now_down and not was:
+            self.presses[side] += 1
+        if self.log_raw and name in ("trigger", "bumper"):
+            log(f"{time.monotonic():.3f} raw {side} {name} {'down' if value else 'up'}")
+        if name != COMBO:
+            return
+        now = time.monotonic()
+        if value:
+            self.down_at[side] = now
+        other = "right" if side == "left" else "left"
+        if value and self.combo_armed and self.down(other, COMBO) and \
+                now - self.down_at.get(other, 0) <= CHORD_WINDOW:
+            self.combo_armed = False
+            self.on_combo()
+        if not self.down("left", COMBO) and not self.down("right", COMBO):
+            self.combo_armed = True
+
+
+def panel_files(render):
+    """The panel's two drawings, plain and shifted, as files for SetOverlayFromFile.
+
+    SteamVR on the Frame takes 201 SetOverlayRaw uploads from a process and refuses every
+    one after that, even for a new overlay; SetOverlayFromFile has no such limit, but loads
+    in the background, so replacing a shown overlay's file blanks it for a moment, and it
+    keeps what it loaded for a file name (seen October 2026). So each drawing goes on an
+    overlay of its own once, and Shift switches which one shows; the rest (hover, press,
+    held modifiers) are small overlays over the keys."""
+    d = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    for name in os.listdir(d):  # leftovers of runs that didn't get to clean up (3 MB each)
+        if name.startswith("ft-duokeys-") and name.endswith(".png"):
+            try:
+                os.unlink(os.path.join(d, name))
+            except OSError:
+                pass
+    paths = {}
+    for shift in (False, True):
+        paths[shift] = os.path.join(d, f"ft-duokeys-{os.getpid()}-{'shift' if shift else 'plain'}.png")
+        render.image(shift, set(), {}, {}).save(paths[shift], compress_level=0)
+    return paths
+
+
+def mat(m):
+    return [[m.m[i][j] for j in range(4)] for i in range(3)]
+
+
+def hmd34(rows):
+    import openvr
+    out = openvr.HmdMatrix34_t()
+    for i in range(3):
+        for j in range(4):
+            out.m[i][j] = rows[i][j]
+    return out
+
+
+class App:
+    def __init__(self, opts):
+        import openvr
+        self.vr = openvr
+        self.opts = opts
+        self.sys = openvr.init(openvr.VRApplication_Overlay)
+        self.ov = openvr.VROverlay()
+        self.inp = openvr.VRInput()
+        self.rm = openvr.VRRenderModels()
+
+        global_on = self.global_input()
+        if opts.get("enable_global_input") and not global_on:
+            openvr.VRSettings().setBool("steamvr", "globalActionSetPriority", True)
+            global_on = self.global_input()
+            log(f"turned on steamvr/globalActionSetPriority: now {global_on}")
+        # How a trigger press is kept from the app behind (see the top of this file).
+        self.take = bool(opts.get("take")) and global_on
+        self.absorb = not opts.get("shared")
+        if opts.get("take") and not global_on:
+            log("--take: SteamVR's global input from overlays (steamvr/globalActionSetPriority) is off; "
+                "run once with --enable-global-input")
+        log("clicks: " + ("taken per hand (global priority), absorbed by the panel if SteamVR doesn't deliver"
+                          if self.take else "absorbed by the panel (SteamVR's laser lands on it)"
+                          if self.absorb else "shared: a press also reaches whatever is behind the keyboard"))
+
+        self.inp.setActionManifestPath(os.path.join(HERE, "actions", "ft_duokeys_actions.json"))
+        self.sets, self.press, self.haptic, self.source = {}, {}, {}, {}
+        for side in ("left", "right"):
+            s = f"/actions/duokeys_{side}"
+            self.sets[side] = self.inp.getActionSetHandle(s)
+            self.press[side] = self.inp.getActionHandle(f"{s}/in/press")
+            self.haptic[side] = self.inp.getActionHandle(f"{s}/out/haptic")
+            self.source[side] = self.inp.getInputSourceHandle(f"/user/hand/{side}")
+        self.idle = self.inp.getActionSetHandle("/actions/duokeys_idle")  # binds nothing
+
+        import render
+        self.render = render
+        self.width = PANEL_WIDTH
+        self.height = PANEL_WIDTH * render.SIZE[1] / render.SIZE[0]
+        self.unit = self.width / render.SIZE[0] * render.PX  # metres per key unit
+        self.files = panel_files(render)
+        self.panels = {}
+        for shift in (False, True):
+            h = self.make_overlay(f"frametop.duokeys.panel{'.shift' if shift else ''}",
+                                  "ft-duokeys" + (" (shift)" if shift else ""), self.width, 120)
+            self.ov.setOverlayFromFile(h, self.files[shift])
+            if self.absorb:
+                # SteamVR's laser lands on the panel, so a trigger press there clicks it (and
+                # we throw the click away) rather than the screen or app behind. The mouse
+                # scale is the texture's size, or SteamVR's hit area is a square (Frametop's
+                # design.md).
+                self.ov.setOverlayInputMethod(h, openvr.VROverlayInputMethod_Mouse)
+                scale = openvr.HmdVector2_t()
+                scale.v[0], scale.v[1] = render.SIZE
+                self.ov.setOverlayMouseScale(h, scale)
+                # Lasers work on it with the dashboard closed too.
+                self.ov.setOverlayFlag(h, openvr.VROverlayFlags_MakeOverlaysInteractiveIfVisible, True)
+            self.panels[shift] = h
+        self.shown_shift = False
+        # A held or latched modifier lights up with an overlay over its key.
+        self.mod_marks = {}
+        for k in layout.KEYS:
+            if k.code in layout.MODIFIERS:
+                h = self.make_overlay(f"frametop.duokeys.mod.{k.code}", f"ft-duokeys {k.label}", 0.04, 121)
+                self.upload(h, *render.mod_mark())
+                self.mod_marks[k] = h
+        self.cursor, self.laser, self.marks = {}, {}, {}
+        for side in ("left", "right"):
+            self.cursor[side] = self.make_overlay(f"frametop.duokeys.cursor.{side}", f"ft-duokeys {side} cursor",
+                                                  0.012, 122)
+            self.upload(self.cursor[side], *render.dot(side))
+            self.laser[side] = self.make_overlay(f"frametop.duokeys.laser.{side}", f"ft-duokeys {side} laser",
+                                                 0.004, 121)
+            self.upload(self.laser[side], *render.beam(side))
+            # Hover and press highlights are overlays of their own, moved over the key, so the
+            # panel's drawing never changes while typing (see panel_files).
+            for kind in ("hover", "press"):
+                h = self.make_overlay(f"frametop.duokeys.{kind}.{side}", f"ft-duokeys {side} {kind}", 0.04, 121)
+                self.upload(h, *render.highlight(side, kind == "press"))
+                self.marks[(side, kind)] = h
+
+        self.keys = None
+        if not opts.get("no_keys"):
+            import uinput
+            self.keys = uinput.Keyboard()
+            log(f"virtual keyboard: {uinput.NAME}")
+        self.typing = layout.Typing()
+        self.takeover = {s: hands.Takeover() for s in ("left", "right")}
+        self.down = {"left": False, "right": False}  # trigger as we last saw it, for edges
+        self.presses_seen = {"left": 0, "right": 0}  # trigger presses taken so far
+        self.hover = {"left": None, "right": None}
+        self.taken_frame = {}  # side -> frames since takeover, until SteamVR delivers the set
+        self.tips = {}  # render model -> tip transform in the controller's frame
+        self.open = False
+        self.waiting = False  # asked to open, waiting for a head pose
+        self.drag = None  # (side, the panel's pose in that hand's laser frame) while carried
+        try:
+            with open(CONFIG) as f:
+                self.config = json.load(f)
+        except (OSError, ValueError):
+            self.config = {}  # "offset": where it opens, in the head's yaw frame (put_down)
+        self.drawn = None
+        self.pose = None
+        self.lock = threading.Lock()
+        self.requests = []
+        self.raw = RawButtons(lambda: self.request("combo"))
+        self.raw.log_raw = bool(opts.get("log_hits"))
+        self.raw.start()
+        self.ctl = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.ctl.bind(CONTROL)
+        self.ctl.setblocking(False)
+        self.poses = (openvr.TrackedDevicePose_t * openvr.k_unMaxTrackedDeviceCount)()
+        self.frame = 0
+        self.apps = openvr.VRApplications()
+        self.in_game = False  # a scene application (a VR game) is running
+        self.game_check = 0.0
+
+    def global_input(self):
+        try:
+            return bool(self.vr.VRSettings().getBool("steamvr", "globalActionSetPriority"))
+        except self.vr.error_code.SettingsError:
+            return False
+
+    def make_overlay(self, key, name, width, sort):
+        try:  # a handle left by an earlier run of ours that crashed
+            self.ov.destroyOverlay(self.ov.findOverlay(key))
+        except self.vr.error_code.OverlayError:
+            pass
+        h = self.ov.createOverlay(key, name)
+        self.ov.setOverlayWidthInMeters(h, width)
+        self.ov.setOverlaySortOrder(h, sort)
+        return h
+
+    def upload(self, handle, data, w, h):
+        buf = (ctypes.c_char * len(data)).from_buffer_copy(data)
+        self.ov.setOverlayRaw(handle, buf, w, h, 4)
+
+    def request(self, cmd):
+        with self.lock:
+            self.requests.append(cmd)
+
+    # --- opening and closing ---
+
+    def show(self):
+        if self.open:
+            return
+        hmd = self.poses[self.vr.k_unTrackedDeviceIndex_Hmd]
+        if not hmd.bPoseIsValid:
+            if not self.waiting:
+                log("opening once the headset is tracked (it's off your head, or in standby)")
+            self.waiting = True
+            return
+        self.waiting = False
+        self.pose = hands.placement(mat(hmd.mDeviceToAbsoluteTracking), self.config.get("offset"))
+        self.place_panels()
+        self.open = True
+        self.drawn = None
+        self.redraw()
+        log("keyboard open")
+
+    def hide(self):
+        self.waiting = False
+        self.drag = None
+        if not self.open:
+            return
+        self.open = False
+        for code, value in self.typing.release_all():
+            self.send(code, value)
+        for side in ("left", "right"):
+            self.ov.hideOverlay(self.cursor[side])
+            self.ov.hideOverlay(self.laser[side])
+            for kind in ("hover", "press"):
+                self.ov.hideOverlay(self.marks[(side, kind)])
+            self.hover[side] = None
+        for h in [*self.panels.values(), *self.mod_marks.values()]:
+            self.ov.hideOverlay(h)
+        log("keyboard closed (each hand is given back once its trigger is up)")
+
+    def send(self, code, value):
+        if self.keys:
+            self.keys.send(code, value)
+        if self.opts.get("no_keys") or self.opts.get("log_hits"):
+            log(f"key {code} {'down' if value else 'up'}")
+
+    def redraw(self):
+        pressed = {s: self.typing.held.get(s) for s in ("left", "right")}
+        for side in ("left", "right"):
+            p = pressed[side] if self.open else None
+            h = self.hover[side] if self.open and p is None else None
+            self.mark(side, "press", p)
+            self.mark(side, "hover", h)
+        state = (self.typing.shift(), frozenset(self.typing.active_mods()), self.drag is not None)
+        if state == self.drawn and not self.drag:
+            return
+        self.drawn = state
+        shift, mods = state[0], state[1]
+        for k, h in self.mod_marks.items():
+            if k.code in mods:
+                self.place(h, k)
+            else:
+                self.ov.hideOverlay(h)
+        # Show the new drawing before hiding the old, so there's no gap between them.
+        self.ov.showOverlay(self.panels[shift])
+        if shift != self.shown_shift:
+            self.ov.hideOverlay(self.panels[self.shown_shift])
+            self.shown_shift = shift
+
+    def put_down(self):
+        """The keyboard was carried and let go: it opens there from now on, as seen from
+        the head (so in front of wherever you face then)."""
+        hmd = self.poses[self.vr.k_unTrackedDeviceIndex_Hmd]
+        if not hmd.bPoseIsValid:
+            return
+        self.config["offset"] = hands.remember(mat(hmd.mDeviceToAbsoluteTracking), self.pose)
+        self.save_config()
+        o = self.config["offset"]
+        log(f"put down: it opens {-o[2][3]:.2f} m ahead and {-o[1][3]:.2f} m below your eyes from now on")
+
+    def save_config(self):
+        try:
+            tmp = CONFIG + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.config, f)
+            os.replace(tmp, CONFIG)
+        except OSError as e:
+            log(f"can't save {CONFIG}: {e}")
+
+    def place_panels(self):
+        for h in self.panels.values():
+            self.ov.setOverlayTransformAbsolute(h, self.vr.TrackingUniverseStanding, hmd34(self.pose))
+
+    def mark(self, side, kind, key):
+        """Show a hand's highlight over `key`, or hide it (None)."""
+        h = self.marks[(side, kind)]
+        if key is None:
+            self.ov.hideOverlay(h)
+        else:
+            self.place(h, key)
+
+    def place(self, h, key):
+        """Show overlay h over `key`, stretched to its size."""
+        g = layout.GAP
+        w, ht = (key.w - g) * self.unit, (key.h - g) * self.unit
+        # The panel's metres from its centre, y up; the texture's margin is in pixels.
+        m = self.render.MARGIN * self.width / self.render.SIZE[0]
+        x = m + (key.x + key.w / 2) * self.unit - self.width / 2
+        y = self.height / 2 - (m + (key.y + key.h / 2) * self.unit)
+        self.ov.setOverlayWidthInMeters(h, w)
+        self.ov.setOverlayTexelAspect(h, w / ht)  # square texture stretched to the key
+        at = hands.mul(self.pose, [[1, 0, 0, x], [0, 1, 0, y], [0, 0, 1, 0.001]])
+        self.ov.setOverlayTransformAbsolute(h, self.vr.TrackingUniverseStanding, hmd34(at))
+        self.ov.showOverlay(h)
+
+    # --- each frame ---
+
+    def controller(self, side):
+        """(device index, laser pose) for a hand's real controller, or None."""
+        role = self.vr.TrackedControllerRole_LeftHand if side == "left" else self.vr.TrackedControllerRole_RightHand
+        i = self.sys.getTrackedDeviceIndexForControllerRole(role)
+        if i == self.vr.k_unTrackedDeviceIndexInvalid or not self.poses[i].bPoseIsValid:
+            return None
+        try:
+            if self.sys.getStringTrackedDeviceProperty(i, self.vr.Prop_TrackingSystemName_String) == "ft_pointer":
+                return None  # Frametop's 3D mouse holds this hand's role: no ray from it
+            model = self.sys.getStringTrackedDeviceProperty(i, self.vr.Prop_RenderModelName_String)
+        except self.vr.error_code.TrackedPropertyError:
+            return None
+        if model not in self.tips:
+            self.tips[model] = self.tip(model)
+        return i, hands.mul(mat(self.poses[i].mDeviceToAbsoluteTracking), self.tips[model])
+
+    def tip(self, model):
+        """Where a controller's laser starts and aims, in its own frame: the render model's
+        tip component (on the Frame it points 40 degrees below the pose's forward)."""
+        try:
+            ok, comp = self.rm.getComponentState(model, "tip", self.vr.VRControllerState_t(),
+                                                 self.vr.RenderModel_ControllerMode_State_t())
+            if ok:
+                return mat(comp.mTrackingToComponentLocal)
+        except Exception as e:  # noqa: BLE001 (any failure: fall back to the known tilt)
+            log(f"no tip for {model}: {e}")
+        c, s = math.cos(math.radians(40)), math.sin(math.radians(40))
+        return [[1, 0, 0, 0], [0, c, s, 0], [0, -s, c, 0]]
+
+    def step(self):
+        self.frame += 1
+        if time.monotonic() >= self.game_check:
+            self.game_check = time.monotonic() + 1
+            try:
+                game = self.apps.getCurrentSceneProcessId() != 0
+            except Exception:  # noqa: BLE001
+                game = False
+            if game != self.in_game:
+                self.in_game = game
+                log("a game is running: the grips combination is off" if game else "no game running")
+                if game:
+                    self.hide()
+        self.sys.getDeviceToAbsoluteTrackingPose(self.vr.TrackingUniverseStanding, 0, self.poses)
+        ev = self.vr.VREvent_t()
+        while self.sys.pollNextEvent(ev):
+            if ev.eventType == self.vr.VREvent_Quit:
+                log("SteamVR is quitting")
+                return False
+        ov_ev = self.vr.VREvent_t()
+        for h in self.panels.values():
+            while self.ov.pollNextOverlayEvent(h, ov_ev)[0]:  # pyopenvr returns (ok, event)
+                pass  # SteamVR's clicks on the panel while absorbing: dropped. They don't
+                # type: its laser follows one hand, so the first pull after switching hands
+                # only moves it over, while vrserver sees every pull.
+        self.control()
+        with self.lock:
+            reqs, self.requests = self.requests, []
+        for cmd in reqs:
+            if cmd == "combo":
+                if self.in_game:
+                    log("grips combination ignored: a game is running (ft-duokeys toggle still works)")
+                    continue
+                cmd = "toggle"
+            if cmd == "toggle":
+                self.hide() if self.open or self.waiting else self.show()
+            elif cmd == "show":
+                self.show()
+            elif cmd == "hide":
+                self.hide()
+        if self.waiting:
+            self.show()
+
+        if self.drag and self.open:
+            # Carried by the grab bar: the panel keeps where it was relative to the hand's
+            # laser when the bar was pressed. Moved before the rays, so that ray stays on it.
+            c = self.controller(self.drag[0])
+            if c:
+                self.pose = hands.mul(c[1], self.drag[1])
+                self.place_panels()
+        rays = {}
+        for side in ("left", "right"):
+            c = self.controller(side)
+            hit = hands.ray_hit(self.pose, self.width, self.height, c[1]) if (c and self.open) else None
+            rays[side] = (c, hit)
+            raw_trigger = self.raw.down(side, "press")
+            before = self.takeover[side].taken
+            taken = self.takeover[side].update(hit, self.width, self.height, raw_trigger, want=self.open) \
+                if self.take else False
+            if taken != before:
+                log(f"{side} hand {'taken' if taken else 'given back'} (frame {self.frame})")
+                if taken:
+                    self.taken_frame[side] = 0
+
+        if self.take:  # otherwise no action set is ever active, so nothing is taken from games
+            # The taken hands' sets, at an overlay-global priority. Always at least one set (the
+            # idle one, which binds nothing): the list replaces the last one, and pyopenvr turns an
+            # empty list into one blank set.
+            active = [s for s in ("left", "right") if self.takeover[s].taken]
+            sets = (self.vr.VRActiveActionSet_t * max(1, len(active)))()
+            for n, side in enumerate(active):
+                sets[n].ulActionSet = self.sets[side]
+                sets[n].ulRestrictedToDevice = self.source[side]
+                sets[n].nPriority = self.vr.k_nActionSetOverlayGlobalPriorityMin + PRIORITY_OFFSET
+            if not active:
+                sets[0].ulActionSet = self.idle
+            try:
+                self.inp.updateActionState(sets)
+            except self.vr.error_code.InputError as e:
+                if self.frame % 900 == 1:
+                    log(f"UpdateActionState: {e}")
+
+        changed = False
+        for side in ("left", "right"):
+            c, hit = rays[side]
+            on = hands.inside(hit, self.width, self.height, self.takeover[side].grow)
+            down = self.trigger(side, on)
+            key = layout.key_at(hit[0] / self.unit - self.render.MARGIN / self.render.PX,
+                                hit[1] / self.unit - self.render.MARGIN / self.render.PX) if on else None
+            if key is not self.hover[side]:
+                self.hover[side] = key
+                changed = True
+                if self.opts.get("log_hits"):
+                    log(f"{side}: {key.label or 'Space' if key else '-'}")
+            if down != self.down[side]:
+                self.down[side] = down
+                changed = True
+                events = []
+                if down and key is not None:
+                    events = self.typing.press(side, key)
+                    self.pulse(side)
+                    if key.code == layout.CLOSE:
+                        self.request("hide")
+                    elif key.code == layout.MOVE and c and not self.drag:
+                        self.drag = (side, hands.mul(hands.inverse(c[1]), self.pose))
+                elif not down:
+                    events = self.typing.release(side)
+                    if self.drag and self.drag[0] == side:
+                        self.drag = None
+                        self.put_down()
+                for code, value in events:
+                    self.send(code, value)
+            self.place_pointer(side, c, hit if on else None)
+        if (changed or self.drag or self.drawn is None) and self.open:
+            self.redraw()  # (while carried, the highlights move with the panel)
+        return True
+
+    def trigger(self, side, on):
+        """Whether this hand's trigger presses a key now."""
+        if not self.open:
+            self.presses_seen[side] = self.raw.presses[side]  # nothing carries over to opening
+            return False
+        if not self.take:
+            pressed = self.raw_trigger(side)  # every frame, so presses elsewhere are used up
+            return on and pressed
+        if not self.takeover[side].taken:
+            return False
+        d = self.inp.getDigitalActionData(self.press[side], self.vr.k_ulInvalidInputValueHandle)
+        if side in self.taken_frame:
+            n = self.taken_frame[side]
+            if d.bActive:
+                log(f"{side} hand: SteamVR delivers its set {n} frame(s) after the takeover")
+                del self.taken_frame[side]
+            elif n >= 45:
+                # SteamVR reports the setting on but delivers nothing (on the Frame, with no game
+                # running, even after a restart). Typing with the triggers from vrws beats a
+                # keyboard that ignores them.
+                log(f"{side} hand: SteamVR hasn't delivered its set after {n} frames, so global input "
+                    "from overlays isn't working here; triggers come from vrserver instead"
+                    + (", and the panel absorbs SteamVR's clicks" if self.absorb else
+                       ": presses also reach the app behind"))
+                self.take = False
+                self.taken_frame.clear()
+                for t in self.takeover.values():
+                    t.taken = False
+                sets = (self.vr.VRActiveActionSet_t * 1)()
+                sets[0].ulActionSet = self.idle
+                self.inp.updateActionState(sets)  # the taken sets off, since step stops updating
+                return False
+            else:
+                self.taken_frame[side] = n + 1
+                if self.raw.down(side, "press"):
+                    log(f"{side} trigger pulled {n} frame(s) after the takeover, before SteamVR delivers "
+                        "the set: that press may have reached the app behind")
+        return bool(d.bActive and d.bState)
+
+    def raw_trigger(self, side):
+        """The trigger from vrserver, with no press lost: a press that came and went since the
+        last frame reads as down for one frame (after an up frame, if the trigger was down)."""
+        count = self.raw.presses[side]
+        if count != self.presses_seen[side]:
+            if self.down[side]:
+                return False  # let the held press go first; the new one shows next frame
+            self.presses_seen[side] = count
+            return True
+        return self.raw.down(side, "press")
+
+    def pulse(self, side):
+        """A short buzz for a key press. The haptic action needs input focus (or global input,
+        --take), which an overlay doesn't have; the legacy pulse reaches the controller anyway."""
+        if self.take and self.takeover[side].taken:
+            try:
+                self.inp.triggerHapticVibrationAction(self.haptic[side], *HAPTIC, self.vr.k_ulInvalidInputValueHandle)
+            except self.vr.error_code.InputError:
+                pass
+            return
+        c = self.controller(side)
+        if c:
+            self.sys.triggerHapticPulse(c[0], 0, 3000)  # microseconds, the most one pulse takes
+
+    def place_pointer(self, side, c, hit):
+        if hit is None or c is None:
+            self.ov.hideOverlay(self.cursor[side])
+            self.ov.hideOverlay(self.laser[side])
+            return
+        x, y = hit[0] - self.width / 2, self.height / 2 - hit[1]
+        at = hands.mul(self.pose, [[1, 0, 0, x], [0, 1, 0, y], [0, 0, 1, 0.002]])
+        self.ov.setOverlayTransformAbsolute(self.cursor[side], self.vr.TrackingUniverseStanding, hmd34(at))
+        self.ov.showOverlay(self.cursor[side])
+        origin = hands.col(c[1], 3)
+        end = hands.col(at, 3)
+        length = math.dist(origin, end)
+        if length < 0.02:
+            self.ov.hideOverlay(self.laser[side])
+            return
+        head = hands.col(mat(self.poses[self.vr.k_unTrackedDeviceIndex_Hmd].mDeviceToAbsoluteTracking), 3)
+        beam = hands.laser_pose(origin, end, head, length)
+        # The beam's texture is 4 x 64 on a 4 mm wide quad: texel aspect stretches it to length.
+        self.ov.setOverlayTexelAspect(self.laser[side], 0.004 * 16 / length)
+        self.ov.setOverlayTransformAbsolute(self.laser[side], self.vr.TrackingUniverseStanding, hmd34(beam))
+        self.ov.showOverlay(self.laser[side])
+
+    def control(self):
+        while True:
+            try:
+                data, addr = self.ctl.recvfrom(256)
+            except BlockingIOError:
+                return
+            cmd = data.decode(errors="replace").strip()
+            if cmd in ("toggle", "show", "hide"):
+                self.request(cmd)
+                reply = {"ok": True}
+            elif cmd == "reset-place":
+                self.config.pop("offset", None)
+                self.save_config()
+                reply = {"ok": True, "place": "default"}
+            elif cmd == "status":
+                reply = {"open": self.open, "take": self.take, "global_input": self.global_input(),
+                         "taken": {s: t.taken for s, t in self.takeover.items()}, "vrws": self.raw.connected,
+                         "keyboard": bool(self.keys)}
+            else:
+                reply = {"error": f"unknown command {cmd!r}"}
+            if addr:
+                try:
+                    self.ctl.sendto(json.dumps(reply).encode(), addr)
+                except OSError:
+                    pass
+
+    def close(self):
+        self.hide()
+        try:
+            sets = (self.vr.VRActiveActionSet_t * 1)()
+            sets[0].ulActionSet = self.idle
+            self.inp.updateActionState(sets)  # nothing at global priority any more
+        except Exception:  # noqa: BLE001
+            pass
+        for h in [*self.panels.values(), *self.cursor.values(), *self.laser.values(), *self.marks.values(),
+                  *self.mod_marks.values()]:
+            try:
+                self.ov.destroyOverlay(h)
+            except Exception:  # noqa: BLE001
+                pass
+        if self.keys:
+            self.keys.close()
+        for path in self.files.values():
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self.vr.shutdown()
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in COMMANDS:
+        return control_client(args[0])
+    opts = {a.lstrip("-").replace("-", "_"): True for a in args}
+    known = {"show", "shared", "take", "no_keys", "log_hits", "enable_global_input", "help", "h"}
+    if opts.keys() - known or "help" in opts or "h" in opts:
+        print(__doc__)
+        return 0 if opts.keys() <= known else 2
+    # Frametop's desktop session hides SteamVR's path registry (its own XDG_CONFIG_HOME).
+    os.environ["XDG_CONFIG_HOME"] = os.path.expanduser("~/.config")
+    # systemd stops the service with SIGTERM: leave the same way as Ctrl+C, so keys held
+    # down are released and the overlays go away.
+    def stop(*_):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, stop)
+    app = App(opts)
+    if opts.get("show"):
+        app.request("show")
+    log("running: both grips together open and close the keyboard")
+    try:
+        next_at = time.monotonic()
+        while True:
+            t0 = time.monotonic()
+            if not app.step():
+                break
+            took = time.monotonic() - t0
+            if took > 0.025 and opts.get("log_hits"):
+                log(f"slow frame: {took * 1e3:.0f} ms")
+            next_at += FRAME if app.open or app.drag else IDLE_FRAME
+            delay = next_at - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                next_at = time.monotonic()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        app.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

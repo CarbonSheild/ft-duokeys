@@ -1,0 +1,17 @@
+# Template: install.sh replaces @DIR@ with this folder's path.
+[Unit]
+Description=ft-duokeys: a VR keyboard both controllers type on at once
+Documentation=file://@DIR@/README.md
+# An overlay client: it needs SteamVR, and starts and stops with it (as Frametop's do).
+After=steamvr.service
+PartOf=steamvr.service
+Requisite=steamvr.service
+
+[Service]
+ExecStart=@DIR@/.venv/bin/python @DIR@/ft-duokeys
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5
+
+[Install]
+WantedBy=steamvr.service
