@@ -123,6 +123,7 @@ class Layout(unittest.TestCase):
         self.assertEqual(layout.key_at(1.75 + 0.5, layout.TOP + 2.5).label, "a")
         self.assertEqual(layout.key_at(11.5, layout.BAR + 0.4).label, "F12")
         self.assertEqual(layout.key_at(11.5, layout.BAR + 0.4).code, 88)
+        self.assertEqual(layout.key_at(14.5, layout.BAR + 0.4).code, layout.KEY_HOME)
         self.assertEqual(layout.key_at(7.5, 0.2).code, layout.MOVE)
         self.assertIsNone(layout.key_at(0.5, 0.2))  # beside the bar
         self.assertIsNone(layout.key_at(-1, 0))

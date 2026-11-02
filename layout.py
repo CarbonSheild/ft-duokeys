@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 KEY_ESC, KEY_BACKSPACE, KEY_TAB, KEY_ENTER = 1, 14, 15, 28
 KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_LEFTALT = 29, 42, 54, 56
-KEY_SPACE, KEY_LEFTMETA, KEY_INSERT, KEY_DELETE = 57, 125, 110, 111
+KEY_SPACE, KEY_LEFTMETA, KEY_INSERT, KEY_DELETE, KEY_HOME = 57, 125, 110, 111, 102
 KEY_UP, KEY_LEFT, KEY_RIGHT, KEY_DOWN = 103, 105, 106, 108
 MODIFIERS = {KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_LEFTALT, KEY_LEFTMETA}
 SHIFTS = {KEY_LEFTSHIFT, KEY_RIGHTSHIFT}
@@ -60,7 +60,7 @@ KEYS = (
     [Key("", "", MOVE, 4.5, 0, 6, BAR - GAP)]
     + _row(BAR, [(f"F{n}", "", code, 1) for n, code in
                  zip(range(1, 13), [59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 87, 88])]
-           + [("Ins", "", KEY_INSERT, 1.5), ("Del", "", KEY_DELETE, 1.5)], h=FROW)
+           + [("Ins", "", KEY_INSERT, 1), ("Del", "", KEY_DELETE, 1), ("Home", "", KEY_HOME, 1)], h=FROW)
     + _row(TOP + 0, [("`", "~", 41, 1)] + _chars(["1!", "2@", "3#", "4$", "5%", "6^", "7&", "8*", "9(", "0)", "-_", "=+"], 2)
          + [("Bksp", "", KEY_BACKSPACE, 2)])
     + _row(TOP + 1, [("Tab", "", KEY_TAB, 1.5)] + _chars(["qQ", "wW", "eE", "rR", "tT", "yY", "uU", "iI", "oO", "pP", "[{", "]}"], 16)
